@@ -52,6 +52,7 @@ from pydantic import BaseModel
 import narsil_manual as nm
 import narsil_sistema as ns
 import narsil_auth
+import narsil_asistente
 
 # --- autenticacion obligatoria ----------------------------------------------
 # La API no arranca sin NARSIL_API_TOKEN definido. Esto se comprueba al
@@ -102,6 +103,7 @@ app.add_middleware(
 # Login de administrador con aprobación bloqueante por móvil (ver narsil_auth.py).
 # Expone /auth/login, /auth/estado/{token}, /auth/aprobar/{token}, /auth/rechazar/{token}.
 app.include_router(narsil_auth.router)
+app.include_router(narsil_asistente.router)
 
 
 def verificar_auth(authorization: Optional[str] = Header(None)):
