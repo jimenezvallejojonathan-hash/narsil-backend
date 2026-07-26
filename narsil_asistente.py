@@ -78,7 +78,7 @@ def enviar_mensaje(p: PeticionAsistente, authorization: Optional[str] = Header(N
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": "claude-sonnet-5",
                 "max_tokens": 500,
                 "system": p.system,
                 "messages": [{"role": "user", "content": p.mensaje}],
