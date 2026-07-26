@@ -139,7 +139,7 @@ def _enviar_ntfy(titulo: str, mensaje: str, url_aprobar: str, url_rechazar: str)
     if not NTFY_TOPIC or httpx is None:
         return False
     try:
-        httpx.post(
+        r = httpx.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=mensaje.encode("utf-8"),
             headers={
@@ -152,8 +152,14 @@ def _enviar_ntfy(titulo: str, mensaje: str, url_aprobar: str, url_rechazar: str)
             },
             timeout=5.0,
         )
+        if r.status_code >= 300:
+            sys.stderr.write(f"AVISO: ntfy.sh respondió {r.status_code}: {r.text[:300]}\n")
+            return False
         return True
-    except Exception:
+    except Exception as e:
+        # Antes fallaba en silencio; ahora queda visible en los logs de Render
+        # (pestaña "Logs"), para poder diagnosticar la causa real la próxima vez.
+        sys.stderr.write(f"AVISO: fallo real al enviar aviso a ntfy.sh: {type(e).__name__}: {e}\n")
         return False
 
 
@@ -211,7 +217,7 @@ def solicitar_login(p: PeticionLogin):
     url_aprobar = f"{BACKEND_URL}/auth/aprobar/{token}"
     url_rechazar = f"{BACKEND_URL}/auth/rechazar/{token}"
     avisos = _avisar_dual(
-        titulo="NARSIL — solicitud de acceso de administrador",
+        titulo="NARSIL - solicitud de acceso de administrador",
         mensaje_ntfy="Alguien intenta entrar como NEO (Administrador) en NARSIL. Aprueba solo si has sido tú.",
         mensaje_callmebot=(
             "🔐 NARSIL: alguien intenta entrar como *NEO* (Administrador).\n"
@@ -302,7 +308,7 @@ def solicitar_registro(p: PeticionRegistro):
     url_aprobar = f"{BACKEND_URL}/auth/registro/aprobar/{token}"
     url_rechazar = f"{BACKEND_URL}/auth/registro/rechazar/{token}"
     avisos = _avisar_dual(
-        titulo="NARSIL — alta de usuario nuevo",
+        titulo="NARSIL - alta de usuario nuevo",
         mensaje_ntfy=f"'{nombre}' quiere darse de alta en NARSIL como usuario. Aprueba solo si lo reconoces.",
         mensaje_callmebot=(
             f"👤 NARSIL: *{nombre}* quiere darse de alta como usuario.\n"
@@ -351,4 +357,3 @@ def rechazar_registro(token: str):
     s.estado = "rechazado"
     registro_auditoria.registrar("registro_rechazado", s.nombre, f"token {token[:8]}... rechazado desde móvil")
     return {"ok": True, "mensaje": f"Alta de '{s.nombre}' rechazada."}
-
