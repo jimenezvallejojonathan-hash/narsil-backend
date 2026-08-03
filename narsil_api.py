@@ -37,6 +37,16 @@ Los endpoints /catalogo y /salud siguen siendo publicos sin token a proposito
 (son datos de referencia sin informacion sensible: modelos de combustible,
 topografia, costes de catalogo, y un ping de salud). Todo lo que crea, lista
 o ejecuta proyectos exige el token.
+
+ACTUALIZADO (03/08/2026): /proyectos/{id}/ejecutar ahora comprueba por sí
+mismo si el proyecto ya tiene un DEM/uso de suelo real registrado (ver
+narsil_sistema.registrar_datos_reales()) y, si los archivos existen en
+disco, usa el terreno real en vez del sintético — automáticamente, sin
+tocar este endpoint el día que llegue el primer vuelo de dron. Antes de
+este cambio, este endpoint siempre usaba terreno sintético aunque se
+hubieran registrado datos reales. La respuesta ahora incluye
+`fuente_terreno` ("real" o "simulado") para que la consola lo muestre con
+claridad.
 """
 
 import os
@@ -232,14 +242,37 @@ def registrar_fuente(proyecto_id: int, f: NuevaFuenteDatos, authorization: Optio
 def ejecutar_motor(proyecto_id: int, authorization: Optional[str] = Header(None)):
     """Corre el motor de optimizacion real (narsil_sistema.py) sobre el
     proyecto y devuelve el resultado + el mapa como imagen base64, para que
-    el navegador lo pueda mostrar sin tener que descargar ningun archivo."""
+    el navegador lo pueda mostrar sin tener que descargar ningun archivo.
+
+    Comprueba por sí mismo si el proyecto ya tiene un DEM/uso de suelo real
+    registrado (ver ns.registrar_datos_reales()) y, si los archivos existen
+    en disco, usa el terreno real en vez del sintético. La respuesta
+    siempre incluye `fuente_terreno` ("real" o "simulado") para que la
+    consola lo muestre con claridad y nadie confunda una estimación con
+    una medición.
+    """
     verificar_auth(authorization)
     try:
         proyecto = ns.cargar_proyecto_bd(proyecto_id, db_path=ns.DB_PATH)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    dem, landuse, cellsize = ns.generar_terreno_desde_proyecto(proyecto, n=120)
+    dem_path = proyecto.get("dem_path")
+    landuse_path = proyecto.get("landuse_path")
+    usar_real = bool(
+        dem_path and landuse_path
+        and os.path.isfile(dem_path) and os.path.isfile(landuse_path)
+    )
+    if usar_real and not ns.HAS_RASTERIO:
+        usar_real = False  # sin rasterio instalado, no se puede leer el GeoTIFF real
+
+    if usar_real:
+        fuente_terreno = "real"
+        dem, landuse, cellsize, _transform = ns.cargar_datos_reales(dem_path, landuse_path)
+    else:
+        fuente_terreno = "simulado"
+        dem, landuse, cellsize = ns.generar_terreno_desde_proyecto(proyecto, n=120)
+
     complejidad, pendiente = ns.calcular_complejidad(dem, landuse, cellsize)
     sensores, gateways, aerostatos, zona_aero, covered = ns.optimizar_malla(
         complejidad, cellsize, spacing_base_m=proyecto["spacing_base_m"],
@@ -248,15 +281,16 @@ def ejecutar_motor(proyecto_id: int, authorization: Optional[str] = Header(None)
 
     mapa_path = f"/tmp/narsil_proyecto_{proyecto_id}_mapa.png"
     csv_path = f"/tmp/narsil_proyecto_{proyecto_id}_sensores.csv"
-    ns.guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, mapa_path)
+    ns.guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, mapa_path, fuente_terreno=fuente_terreno)
     ns.exportar_csv(sensores, gateways, aerostatos, cellsize, csv_path)
-    ns.guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, db_path=ns.DB_PATH)
+    ns.guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, fuente_terreno=fuente_terreno, db_path=ns.DB_PATH)
 
     with open(mapa_path, "rb") as f:
         mapa_b64 = base64.b64encode(f.read()).decode("ascii")
 
     return {
         "proyecto_id": proyecto_id,
+        "fuente_terreno": fuente_terreno,
         "pendiente_media_pct": round(float(pendiente.mean()), 1),
         "pendiente_max_pct": round(float(pendiente.max()), 1),
         "resultado": costes,
