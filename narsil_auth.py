@@ -3,39 +3,51 @@ narsil_auth.py — Autenticación y altas de usuario con aprobación bloqueante
 por móvil (NARSIL_control.html), por DOS vías redundantes: ntfy.sh (push)
 y WhatsApp vía CallMeBot.
 
-Cubre dos flujos, con el mismo principio de fondo:
+ACTUALIZADO (03/08/2026):
+- El login de NEO ya NO comprueba contraseña. La única puerta real es tu
+  aprobación explícita desde el móvil ("si yo no autorizo no entra
+  nadie"). Para que esto sea seguro y no solo cómodo, se limita cuántas
+  solicitudes de login se pueden crear en poco tiempo (ver
+  LIMITE_SOLICITUDES_LOGIN más abajo) — sin esto, cualquiera podría
+  generarte avisos de aprobación sin parar hasta que tocaras "aprobar"
+  por costumbre o por error (el mismo patrón usado en el hackeo de Uber
+  en 2022, conocido como "fatiga de MFA").
+- El registro de auditoría ya no vive solo en memoria: usa la misma
+  narsil.db que comparten narsil_manual.py y narsil_sistema.py, así que
+  sobrevive a los reinicios de Render.
 
-  A) Login de Administrador (NEO) — una sola cuenta válida, contraseña
-     comparada por huella SHA-256, bloqueado hasta aprobación por móvil.
-
-  B) Alta de un usuario nuevo (rol "usuario") — ahora también con
-     contraseña propia (huella SHA-256, nunca en texto plano), bloqueada
-     hasta aprobación por móvil. El aviso que llega al teléfono SOLO
-     contiene el nombre elegido — LA CONTRASEÑA NUNCA SE ENVÍA POR SMS,
-     WHATSAPP NI NINGÚN OTRO CANAL. Es una norma fija, no configurable:
-     un canal de mensajería no es un lugar seguro para una contraseña,
-     tenga o no tenga cifrado el resto del sistema.
+Cubre dos flujos:
+A) Login de Administrador (NEO) — sin contraseña, bloqueado hasta
+   aprobación por móvil.
+B) Alta de un usuario nuevo (rol "usuario") — con contraseña propia
+   (huella SHA-256, nunca en texto plano), bloqueada hasta aprobación
+   por móvil. El aviso que llega al teléfono SOLO contiene el nombre
+   elegido — LA CONTRASEÑA NUNCA SE ENVÍA POR SMS, WHATSAPP NI NINGÚN
+   OTRO CANAL. Es una norma fija, no configurable.
 
 Variables de entorno relevantes:
-  NARSIL_ADMIN_PASSWORD_HASH  — huella SHA-256 de la contraseña de NEO
-  NARSIL_NTFY_TOPIC           — tema privado de ntfy.sh (tú lo eliges)
-  NARSIL_BACKEND_URL          — URL pública de este backend
-  NARSIL_CALLMEBOT_PHONE      — tu número de WhatsApp (con prefijo, sin '+')
-  NARSIL_CALLMEBOT_APIKEY     — clave que te da CallMeBot al activarlo tú
-                                 mismo (envía "I allow callmebot to send me
-                                 messages" al +34 644 51 95 23 desde tu
-                                 propio WhatsApp; te responde con la clave)
+  NARSIL_NTFY_TOPIC        — tema privado de ntfy.sh (tú lo eliges).
+                             Trátalo como una contraseña: quien conozca
+                             el nombre exacto puede publicar avisos ahí.
+  NARSIL_BACKEND_URL       — URL pública de este backend
+  NARSIL_CALLMEBOT_PHONE   — tu número de WhatsApp (con prefijo, sin '+')
+  NARSIL_CALLMEBOT_APIKEY  — clave que te da CallMeBot al activarlo tú
+                             mismo (envía "I allow callmebot to send me
+                             messages" al +34 644 51 95 23 desde tu
+                             propio WhatsApp; te responde con la clave)
+  NARSIL_LIMITE_LOGIN_INTENTOS  — máximo de solicitudes de login por
+                             ventana de tiempo (por defecto 3)
+  NARSIL_LIMITE_LOGIN_VENTANA_S — duración de esa ventana en segundos
+                             (por defecto 600 = 10 minutos)
 
-AUDITORÍA REAL (26/07/2026): cada evento de login/alta (solicitud creada,
-aprobada, rechazada, caducada) queda registrado en el mismo
-RegistroInmutable (narsil_registro_inmutable.py) que ya usa AEGIS para los
-paros de seguridad de TALOS — no es una copia parecida, es literalmente la
-misma clase e implementación, importada desde el mismo sitio. Esto permite
-comprobar en cualquier momento que nadie ha alterado a mano el historial de
-accesos, con la misma verificación de cadena de hashes que ya se probó con
-AEGIS.
+NARSIL_ADMIN_PASSWORD_HASH ya NO se usa — puedes borrarla de las
+variables de entorno en Render.
+
+AUDITORÍA REAL: cada evento de login/alta (solicitud creada, aprobada,
+rechazada, caducada, bloqueada por límite) queda registrado en el mismo
+RegistroInmutable (narsil_registro_inmutable.py) que ya usa AEGIS para
+los paros de seguridad de TALOS, ahora persistido en narsil.db.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -57,22 +69,10 @@ try:
 except ImportError:  # se resuelve en requirements.txt del backend
     httpx = None
 
-
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
 ADMIN_USUARIO = "NEO"
-
-_HASH_RESPALDO_DESARROLLO = hashlib.sha256("NARSIL2026@#".encode()).hexdigest()
-ADMIN_PASSWORD_HASH = os.environ.get("NARSIL_ADMIN_PASSWORD_HASH")
-if not ADMIN_PASSWORD_HASH:
-    sys.stderr.write(
-        "\nAVISO: NARSIL_ADMIN_PASSWORD_HASH no está definida. Usando la huella "
-        "de la contraseña acordada como respaldo de desarrollo. Antes de desplegar "
-        "en producción, genera tu propia huella y defínela como variable de entorno:\n"
-        "    python3 -c \"import hashlib;print(hashlib.sha256(b'TU_CONTRASEÑA').hexdigest())\"\n\n"
-    )
-    ADMIN_PASSWORD_HASH = _HASH_RESPALDO_DESARROLLO
 
 NTFY_TOPIC = os.environ.get("NARSIL_NTFY_TOPIC", "")
 BACKEND_URL = os.environ.get("NARSIL_BACKEND_URL", "http://localhost:8000")
@@ -80,6 +80,24 @@ CALLMEBOT_PHONE = os.environ.get("NARSIL_CALLMEBOT_PHONE", "")
 CALLMEBOT_APIKEY = os.environ.get("NARSIL_CALLMEBOT_APIKEY", "")
 
 CADUCIDAD_SEGUNDOS = 5 * 60  # 5 minutos
+
+# Límite de solicitudes de login en ventana de tiempo, para que nadie
+# pueda generarte avisos de aprobación sin parar (fatiga de MFA).
+LIMITE_SOLICITUDES_LOGIN = int(os.environ.get("NARSIL_LIMITE_LOGIN_INTENTOS", "3"))
+VENTANA_LIMITE_SEGUNDOS = int(os.environ.get("NARSIL_LIMITE_LOGIN_VENTANA_S", "600"))
+_historial_intentos_login: list[float] = []
+
+
+def _demasiados_intentos_recientes() -> bool:
+    ahora = time.time()
+    global _historial_intentos_login
+    _historial_intentos_login = [t for t in _historial_intentos_login
+                                  if ahora - t < VENTANA_LIMITE_SEGUNDOS]
+    return len(_historial_intentos_login) >= LIMITE_SOLICITUDES_LOGIN
+
+
+def _registrar_intento_login():
+    _historial_intentos_login.append(time.time())
 
 
 def hash_password(password: str) -> str:
@@ -113,9 +131,10 @@ _solicitudes_registro: dict[str, SolicitudRegistro] = {}
 _sesiones_validas: set[str] = set()
 
 # Mismo RegistroInmutable que usa AEGIS para los paros de seguridad de
-# TALOS — aquí registramos cada evento real de login/alta, con la unidad
-# siendo el nombre de usuario (nunca la contraseña ni su huella).
-registro_auditoria = RegistroInmutable()
+# TALOS — persistido en la misma narsil.db que narsil_manual.py y
+# narsil_sistema.py, así que sobrevive a los reinicios de Render.
+_DB_COMPARTIDA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "narsil.db")
+registro_auditoria = RegistroInmutable(db_path=_DB_COMPARTIDA)
 
 
 def _purgar_caducadas():
@@ -157,8 +176,6 @@ def _enviar_ntfy(titulo: str, mensaje: str, url_aprobar: str, url_rechazar: str)
             return False
         return True
     except Exception as e:
-        # Antes fallaba en silencio; ahora queda visible en los logs de Render
-        # (pestaña "Logs"), para poder diagnosticar la causa real la próxima vez.
         sys.stderr.write(f"AVISO: fallo real al enviar aviso a ntfy.sh: {type(e).__name__}: {e}\n")
         return False
 
@@ -197,7 +214,7 @@ router = APIRouter(prefix="/auth", tags=["autenticacion"])
 
 class PeticionLogin(BaseModel):
     usuario: str
-    password: str
+    password: str = ""  # ya no se usa para validar; se acepta por compatibilidad con la consola
 
 
 class PeticionRegistro(BaseModel):
@@ -208,17 +225,35 @@ class PeticionRegistro(BaseModel):
 @router.post("/login")
 def solicitar_login(p: PeticionLogin):
     _purgar_caducadas()
-    if p.usuario != ADMIN_USUARIO or hash_password(p.password) != ADMIN_PASSWORD_HASH:
-        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+
+    # Ya no se comprueba ninguna contraseña: la única puerta real es tu
+    # aprobación explícita desde el móvil. 'usuario' solo filtra
+    # solicitudes obviamente erróneas, no es una barrera de seguridad.
+    if p.usuario.strip().upper() != ADMIN_USUARIO:
+        raise HTTPException(status_code=401, detail="Usuario desconocido")
+
+    if _demasiados_intentos_recientes():
+        registro_auditoria.registrar(
+            "login_bloqueado_por_limite", ADMIN_USUARIO,
+            f"más de {LIMITE_SOLICITUDES_LOGIN} solicitudes en {VENTANA_LIMITE_SEGUNDOS}s",
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"Demasiadas solicitudes de acceso recientes. Espera unos minutos "
+                   f"antes de volver a intentarlo (límite: {LIMITE_SOLICITUDES_LOGIN} "
+                   f"cada {VENTANA_LIMITE_SEGUNDOS // 60} min).",
+        )
+    _registrar_intento_login()
 
     token = secrets.token_urlsafe(24)
     _solicitudes[token] = SolicitudLogin(token=token, creado_en=time.time())
     registro_auditoria.registrar("login_solicitado", ADMIN_USUARIO, f"token {token[:8]}...")
+
     url_aprobar = f"{BACKEND_URL}/auth/aprobar/{token}"
     url_rechazar = f"{BACKEND_URL}/auth/rechazar/{token}"
     avisos = _avisar_dual(
         titulo="NARSIL - solicitud de acceso de administrador",
-        mensaje_ntfy="Alguien intenta entrar como NEO (Administrador) en NARSIL. Aprueba solo si has sido tú.",
+        mensaje_ntfy="Alguien intenta entrar como NEO (Administrador) en NARSIL. Aprueba SOLO si has sido tú.",
         mensaje_callmebot=(
             "🔐 NARSIL: alguien intenta entrar como *NEO* (Administrador).\n"
             f"Aprobar: {url_aprobar}\nRechazar: {url_rechazar}"
@@ -305,6 +340,7 @@ def solicitar_registro(p: PeticionRegistro):
         token=token, nombre=nombre, password_hash=hash_password(p.password), creado_en=time.time(),
     )
     registro_auditoria.registrar("registro_solicitado", nombre, f"token {token[:8]}...")
+
     url_aprobar = f"{BACKEND_URL}/auth/registro/aprobar/{token}"
     url_rechazar = f"{BACKEND_URL}/auth/registro/rechazar/{token}"
     avisos = _avisar_dual(
@@ -327,8 +363,6 @@ def consultar_estado_registro(token: str):
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     respuesta = {"estado": s.estado, "nombre": s.nombre}
     if s.estado == "aprobado":
-        # Se devuelve la HUELLA (nunca la contraseña) para que el cliente
-        # guarde el usuario ya dado de alta en window.storage.
         respuesta["password_hash"] = s.password_hash
     return respuesta
 
