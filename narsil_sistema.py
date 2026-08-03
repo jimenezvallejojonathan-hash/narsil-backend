@@ -7,14 +7,30 @@ y aerostatos, en funcion de la pendiente real y el modelo de combustible
 Rothermel/Scott-Burgan de cada celda del terreno.
 
 Este script funciona en dos modos:
-  1) MODO REAL: si le pasas un DEM (GeoTIFF) y una capa de uso de suelo
-     (GeoTIFF con codigos de clase), usa rasterio para leerlos.
-  2) MODO DEMO: si no hay archivos reales, genera un terreno sintetico de
-     ejemplo para que puedas ver el sistema funcionando de principio a fin.
+  1) MODO REAL: si el proyecto tiene registradas rutas a un DEM (GeoTIFF) y
+     una capa de uso de suelo (GeoTIFF con codigos de clase) — columnas
+     `dem_path` / `landuse_path` en la tabla `proyectos` — usa rasterio
+     para leerlos de verdad.
+  2) MODO DEMO/ESTIMADO: si no hay archivos reales todavia (el caso normal
+     antes de que se haga el vuelo de dron sobre la parcela), genera un
+     terreno SINTETICO a partir de la categoria de topografia elegida a
+     mano (Regular/Ondulado/Escarpado).
 
-IMPORTANTE: el modo demo es una simulacion con datos inventados, NO una
-estimacion real de ningun terreno. Sirve para validar la logica del sistema
-antes de conectarlo a datos GIS/dron verificados.
+ACTUALIZADO (03/08/2026): antes, la respuesta no distinguia si el terreno
+usado era real o sintetico — un numero como "pendiente media: 34.7%" se
+via igual en ambos casos, aunque en el modo demo no tiene ninguna relacion
+con el terreno fisico real de la parcela. Ahora cada resultado (impreso en
+consola y guardado en la base de datos) lleva explicito el campo
+`fuente_terreno` ("real" o "simulado"), para que nadie confunda una
+estimacion con una medicion.
+
+Ademas, `ejecutar_para_proyecto` ahora comprueba SOLO por si mismo si el
+proyecto ya tiene un DEM/uso de suelo real registrado (`dem_path` /
+`landuse_path`) y, si existen los archivos en disco, usa
+`cargar_datos_reales()` automaticamente en vez del terreno sintetico — sin
+que haga falta cambiar nada mas en el codigo el dia que llegue el primer
+vuelo de dron. Mientras esas columnas esten vacias (el caso de hoy), sigue
+usando el terreno sintetico, pero marcandolo siempre como tal.
 
 Dependencias: numpy, scipy, matplotlib (incluidas). rasterio es opcional,
 solo se necesita para leer GeoTIFFs reales (pip install rasterio).
@@ -46,6 +62,16 @@ CODE_TO_FUELNAME = {
     "SH7": "eucaliptal", "NB9": "rocoso",
 }
 
+# Mapeo por defecto de codigos de raster de uso de suelo -> nombre de clase
+# de combustible, para cuando se cargue un landuse_path real y el proyecto
+# no tenga uno propio mas especifico definido. Ajustalo si tu capa de uso
+# de suelo real usa otra codificacion.
+LANDUSE_MAP_POR_DEFECTO = {
+    1: "pasto_bajo", 2: "pasto_alto", 3: "matorral_disperso",
+    4: "matorral_denso", 5: "encinar", 6: "pinar",
+    7: "eucaliptal", 8: "rocoso",
+}
+
 # ---------------------------------------------------------------------------
 # Modelos de combustible Rothermel/Scott-Burgan -> multiplicador de espaciado
 # (mismo criterio usado en el simulador manual: >1 = se puede espaciar mas,
@@ -71,14 +97,35 @@ DEFAULT_COSTS = dict(
 
 
 # ---------------------------------------------------------------------------
+# 0. Preparacion de columnas para el DEM/uso de suelo real (dron)
+# ---------------------------------------------------------------------------
+def asegurar_columnas_datos_reales(db_path=DB_PATH):
+    """Anade (si no existen ya) las columnas dem_path / landuse_path a la
+    tabla proyectos. No hace nada si ya existen o si la tabla proyectos
+    todavia no se ha creado (narsil_manual.py la crea la primera vez que
+    se guarda un proyecto)."""
+    conn = sqlite3.connect(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(proyectos)").fetchall()}
+    if cols:  # la tabla existe
+        if "dem_path" not in cols:
+            conn.execute("ALTER TABLE proyectos ADD COLUMN dem_path TEXT")
+        if "landuse_path" not in cols:
+            conn.execute("ALTER TABLE proyectos ADD COLUMN landuse_path TEXT")
+        conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # 1. CARGA DE DATOS
 # ---------------------------------------------------------------------------
-def cargar_datos_reales(dem_path, landuse_path, landuse_map):
+def cargar_datos_reales(dem_path, landuse_path, landuse_map=None):
     """Lee un DEM y una capa de uso de suelo reales via rasterio.
-    landuse_map: dict {codigo_raster: nombre_clase_fuel_model}
+    landuse_map: dict {codigo_raster: nombre_clase_fuel_model}. Si no se
+    pasa, usa LANDUSE_MAP_POR_DEFECTO.
     """
     if not HAS_RASTERIO:
         raise RuntimeError("rasterio no esta instalado. pip install rasterio --break-system-packages")
+    landuse_map = landuse_map or LANDUSE_MAP_POR_DEFECTO
     with rasterio.open(dem_path) as src:
         dem = src.read(1).astype(float)
         cellsize = src.res[0]
@@ -94,20 +141,42 @@ def cargar_datos_reales(dem_path, landuse_path, landuse_map):
 
 def cargar_proyecto_bd(proyecto_id, db_path=DB_PATH):
     """Lee un proyecto creado con narsil_manual.py de la base de datos
-    compartida. Devuelve un dict con todos sus parametros."""
+    compartida. Devuelve un dict con todos sus parametros, incluyendo
+    dem_path/landuse_path si ya se han registrado (None si no)."""
+    asegurar_columnas_datos_reales(db_path)
     conn = sqlite3.connect(db_path)
     row = conn.execute(
         "SELECT nombre, area_ha, pct_complejo, fuel_simple, fuel_complejo, "
-        "topografia, spacing_base_m, estrategia, aero_radio_km FROM proyectos "
-        "WHERE id=?", (proyecto_id,)).fetchone()
+        "topografia, spacing_base_m, estrategia, aero_radio_km, dem_path, landuse_path "
+        "FROM proyectos WHERE id=?", (proyecto_id,)).fetchone()
     conn.close()
     if row is None:
         raise ValueError(f"No existe el proyecto #{proyecto_id} en {db_path}")
-    nombre, area_ha, pct_complejo, fuel_simple, fuel_complejo, topo, spacing, estrategia, aero_radio = row
+    (nombre, area_ha, pct_complejo, fuel_simple, fuel_complejo, topo, spacing,
+     estrategia, aero_radio, dem_path, landuse_path) = row
     return dict(nombre=nombre, area_ha=area_ha, pct_complejo=pct_complejo,
                 fuel_simple=fuel_simple, fuel_complejo=fuel_complejo,
                 topografia=topo, spacing_base_m=spacing, estrategia=estrategia,
-                aero_radio_km=aero_radio)
+                aero_radio_km=aero_radio, dem_path=dem_path, landuse_path=landuse_path)
+
+
+def registrar_datos_reales(proyecto_id, dem_path, landuse_path, db_path=DB_PATH):
+    """Vincula un DEM y una capa de uso de suelo reales (por ejemplo, del
+    vuelo de dron) a un proyecto ya existente. A partir de este momento,
+    ejecutar_para_proyecto() usara estos archivos en vez del terreno
+    sintetico, automaticamente."""
+    asegurar_columnas_datos_reales(db_path)
+    if not os.path.isfile(dem_path):
+        raise FileNotFoundError(f"No existe el DEM: {dem_path}")
+    if not os.path.isfile(landuse_path):
+        raise FileNotFoundError(f"No existe la capa de uso de suelo: {landuse_path}")
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE proyectos SET dem_path=?, landuse_path=? WHERE id=?",
+                 (dem_path, landuse_path, proyecto_id))
+    conn.commit()
+    conn.close()
+    print(f"Proyecto #{proyecto_id}: DEM y uso de suelo reales registrados. "
+          f"La proxima ejecucion usara terreno REAL, no simulado.")
 
 
 def generar_terreno_desde_proyecto(proyecto, n=120, seed=7):
@@ -116,7 +185,7 @@ def generar_terreno_desde_proyecto(proyecto, n=120, seed=7):
     (pct_complejo, modelos de combustible simple/complejo, topografia).
     Sigue sin ser un terreno real: es el puente entre la estimacion manual
     y el motor de optimizacion, hasta que haya un DEM/uso de suelo real que
-    cargar con cargar_datos_reales().
+    cargar con cargar_datos_reales() (ver ejecutar_para_proyecto()).
     """
     rng = np.random.default_rng(seed)
     cellsize = 20
@@ -286,7 +355,7 @@ COLOR_LANDUSE = {
     "eucaliptal": "#994a1a", "rocoso": "#888780",
 }
 
-def guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, out_png):
+def guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, out_png, fuente_terreno="simulado"):
     n = landuse.shape[0]
     rgb = np.zeros((n, n, 3))
     for cls, hexcol in COLOR_LANDUSE.items():
@@ -309,7 +378,8 @@ def guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, out_png
         ax.scatter([ax_], [ay], c="#534ab7", marker="*", s=160, zorder=7,
                    label="Aerostato" if (ay, ax_, cnt) == aerostatos[0] else None)
 
-    ax.set_title("NARSIL - malla optimizada (DEMO, datos sinteticos)")
+    etiqueta_fuente = "DATOS REALES (DEM de vuelo)" if fuente_terreno == "real" else "DEMO / ESTIMADO (terreno simulado, NO medido)"
+    ax.set_title(f"NARSIL - malla optimizada — {etiqueta_fuente}")
     ax.legend(loc="upper right", fontsize=8)
     ax.axis("off")
     fig.tight_layout()
@@ -329,10 +399,12 @@ def exportar_csv(sensores, gateways, aerostatos, cellsize, out_csv):
             w.writerow(["aerostato", round(i, 1), round(j, 1), j * cellsize, i * cellsize, n])
 
 
-def guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, db_path=DB_PATH):
+def guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, fuente_terreno="simulado", db_path=DB_PATH):
     """Guarda el resultado de una corrida del motor de optimizacion (real o
     sintetica-seeded) vinculada al proyecto manual original, y marca sus
-    fuentes de datos pendientes como 'procesado'."""
+    fuentes de datos pendientes como 'procesado'. Ahora incluye
+    fuente_terreno ('real' o 'simulado') para que quede constancia
+    permanente de que tipo de dato se uso en cada corrida."""
     conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS resultados_gis (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -341,14 +413,19 @@ def guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, db_path=D
         n_sensores INTEGER, n_gateways INTEGER, n_aerostatos INTEGER,
         coste_inicial REAL, coste_anual REAL,
         mapa_path TEXT, csv_path TEXT,
+        fuente_terreno TEXT NOT NULL DEFAULT 'simulado',
         FOREIGN KEY(proyecto_id) REFERENCES proyectos(id)
     )""")
+    # por si la tabla ya existia de antes sin la columna nueva
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(resultados_gis)").fetchall()}
+    if "fuente_terreno" not in cols:
+        conn.execute("ALTER TABLE resultados_gis ADD COLUMN fuente_terreno TEXT NOT NULL DEFAULT 'simulado'")
     conn.execute("""INSERT INTO resultados_gis
-        (proyecto_id, fecha, n_sensores, n_gateways, n_aerostatos, coste_inicial, coste_anual, mapa_path, csv_path)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (proyecto_id, fecha, n_sensores, n_gateways, n_aerostatos, coste_inicial, coste_anual, mapa_path, csv_path, fuente_terreno)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (proyecto_id, datetime.now().strftime("%Y-%m-%d %H:%M"),
          costes["n_sensores"], costes["n_gateways"], costes["n_aerostatos"],
-         costes["coste_inicial"], costes["coste_anual"], mapa_path, csv_path))
+         costes["coste_inicial"], costes["coste_anual"], mapa_path, csv_path, fuente_terreno))
     conn.execute("UPDATE fuentes_datos SET estado='procesado' WHERE proyecto_id=? AND estado='pendiente'",
                  (proyecto_id,))
     conn.commit()
@@ -356,15 +433,41 @@ def guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, db_path=D
 
 
 def ejecutar_para_proyecto(proyecto_id, db_path=DB_PATH):
-    """Pipeline completo: lee un proyecto manual de la BD, genera el terreno
-    (sintetico-seeded o real si ya hay rasterio+archivos conectados),
-    optimiza la malla y guarda mapa+csv+registro de vuelta en la BD."""
+    """Pipeline completo: lee un proyecto manual de la BD, y decide POR SI
+    MISMO si usar el DEM/uso de suelo real (si ya se registro con
+    registrar_datos_reales() y los archivos existen en disco) o el terreno
+    sintetico de siempre. Optimiza la malla y guarda mapa+csv+registro de
+    vuelta en la BD, marcando siempre fuente_terreno ('real' o 'simulado')."""
     proyecto = cargar_proyecto_bd(proyecto_id, db_path)
     print(f"Proyecto #{proyecto_id}: {proyecto['nombre']}  ({proyecto['area_ha']} ha)")
 
-    dem, landuse, cellsize = generar_terreno_desde_proyecto(proyecto, n=120)
+    dem_path = proyecto.get("dem_path")
+    landuse_path = proyecto.get("landuse_path")
+    usar_real = bool(dem_path and landuse_path and os.path.isfile(dem_path) and os.path.isfile(landuse_path))
+
+    if usar_real and not HAS_RASTERIO:
+        print("AVISO: hay DEM/uso de suelo registrados para este proyecto, pero "
+              "rasterio no esta instalado en este entorno (pip install rasterio). "
+              "Se usara el terreno SIMULADO por esta vez.")
+        usar_real = False
+
+    if usar_real:
+        fuente_terreno = "real"
+        dem, landuse, cellsize, _transform = cargar_datos_reales(dem_path, landuse_path)
+        print(f"Terreno REAL cargado desde {dem_path} / {landuse_path}.")
+    else:
+        fuente_terreno = "simulado"
+        dem, landuse, cellsize = generar_terreno_desde_proyecto(proyecto, n=120)
+        print("AVISO: sin DEM/uso de suelo reales registrados todavia para este "
+              "proyecto — usando terreno SIMULADO a partir de la categoria de "
+              "topografia elegida a mano. Los numeros de pendiente que siguen "
+              "NO son una medicion real de esta parcela. En cuanto tengas el "
+              "vuelo de dron, usa registrar_datos_reales(proyecto_id, dem_path, "
+              "landuse_path) y esta misma funcion pasara a usar datos reales sola.")
+
     complejidad, pendiente = calcular_complejidad(dem, landuse, cellsize)
-    print(f"Pendiente media: {pendiente.mean():.1f}%  (max {pendiente.max():.1f}%)")
+    etiqueta = "REAL" if fuente_terreno == "real" else "SIMULADA (no medida)"
+    print(f"Pendiente media [{etiqueta}]: {pendiente.mean():.1f}%  (max {pendiente.max():.1f}%)")
 
     sensores, gateways, aerostatos, zona_aero, covered = optimizar_malla(
         complejidad, cellsize, spacing_base_m=proyecto["spacing_base_m"],
@@ -377,10 +480,10 @@ def ejecutar_para_proyecto(proyecto_id, db_path=DB_PATH):
 
     mapa_path = f"/mnt/user-data/outputs/narsil_proyecto_{proyecto_id}_mapa.png"
     csv_path = f"/mnt/user-data/outputs/narsil_proyecto_{proyecto_id}_sensores.csv"
-    guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, mapa_path)
+    guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize, mapa_path, fuente_terreno=fuente_terreno)
     exportar_csv(sensores, gateways, aerostatos, cellsize, csv_path)
-    guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, db_path)
-    print(f"\nMapa: {mapa_path}\nCSV: {csv_path}\nResultado vinculado al proyecto #{proyecto_id} en {db_path}")
+    guardar_resultado_gis_bd(proyecto_id, costes, mapa_path, csv_path, fuente_terreno=fuente_terreno, db_path=db_path)
+    print(f"\nMapa: {mapa_path}\nCSV: {csv_path}\nResultado vinculado al proyecto #{proyecto_id} en {db_path} (fuente_terreno={fuente_terreno})")
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +497,7 @@ def main_demo_generico():
     print(f"Terreno sintetico: {dem.shape[0]}x{dem.shape[1]} celdas de {cellsize}m -> {area_ha:.0f} ha")
 
     complejidad, pendiente = calcular_complejidad(dem, landuse, cellsize)
-    print(f"Pendiente media sintetica: {pendiente.mean():.1f}%  (max {pendiente.max():.1f}%)")
+    print(f"Pendiente media sintetica [SIMULADA, no medida]: {pendiente.mean():.1f}%  (max {pendiente.max():.1f}%)")
 
     sensores, gateways, aerostatos, zona_aero, covered = optimizar_malla(
         complejidad, cellsize, spacing_base_m=100)
@@ -405,7 +508,7 @@ def main_demo_generico():
         print(f"  {k}: {v}")
 
     guardar_mapa(dem, landuse, sensores, gateways, aerostatos, cellsize,
-                 "/mnt/user-data/outputs/narsil_demo_mapa.png")
+                 "/mnt/user-data/outputs/narsil_demo_mapa.png", fuente_terreno="simulado")
     exportar_csv(sensores, gateways, aerostatos, cellsize,
                  "/mnt/user-data/outputs/narsil_demo_sensores.csv")
     print("\nMapa y CSV guardados en /mnt/user-data/outputs/")
@@ -416,8 +519,14 @@ if __name__ == "__main__":
     parser.add_argument("--proyecto", type=int, default=None,
                          help="ID de un proyecto creado con narsil_manual.py a procesar")
     parser.add_argument("--db", type=str, default=DB_PATH, help="ruta a narsil.db")
+    parser.add_argument("--registrar-real", nargs=2, metavar=("DEM_PATH", "LANDUSE_PATH"),
+                         default=None, help="Vincula un DEM y uso de suelo reales al --proyecto indicado")
     args = parser.parse_args()
-    if args.proyecto is not None:
+    if args.registrar_real is not None:
+        if args.proyecto is None:
+            raise SystemExit("--registrar-real requiere --proyecto")
+        registrar_datos_reales(args.proyecto, args.registrar_real[0], args.registrar_real[1], db_path=args.db)
+    elif args.proyecto is not None:
         ejecutar_para_proyecto(args.proyecto, db_path=args.db)
     else:
         main_demo_generico()
