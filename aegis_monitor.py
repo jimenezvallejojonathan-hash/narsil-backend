@@ -4,10 +4,11 @@ aegis_monitor.py — Referencia técnica del módulo AEGIS (NARSIL_Arquitectura.
 AEGIS es el "supervisor transversal de seguridad": no decide, no ejecuta
 misiones, y NO forma parte de la cadena SOLOMON -> IRIS -> TALOS. Su unica
 potestad es forzar un paro seguro sobre TALOS ante:
-    1. Perdida de señal / perdida de control (heartbeat de la unidad).
-    2. Manipulacion detectada (comando sin firma valida o fuera de origen).
-    3. Fallo de integridad de datos (telemetria corrupta o fisicamente
-       implausible).
+
+1. Perdida de señal / perdida de control (heartbeat de la unidad).
+2. Manipulacion detectada (comando sin firma valida o fuera de origen).
+3. Fallo de integridad de datos (telemetria corrupta o fisicamente
+   implausible).
 
 Requisito de diseño (seccion 4 y 7 de NARSIL_Arquitectura.odt): AEGIS debe
 ser fisica/logicamente independiente de la cadena de decision. Por eso esta
@@ -20,24 +21,30 @@ Este archivo es una PRUEBA DE CONCEPTO ejecutable, no el codigo final que
 correria sobre TALOS en campo (que dependera del hardware real elegido).
 Sirve para validar que los tres criterios de disparo son implementables y
 verificables, y para dejarle a CLOUD un punto de partida concreto.
-"""
 
+ACTUALIZADO (03/08/2026): el registro de paros de seguridad ahora persiste
+en la misma narsil.db compartida con narsil_manual.py y narsil_sistema.py
+(antes vivía solo en memoria y se perdía en cada reinicio de Render).
+"""
 from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from narsil_registro_inmutable import RegistroInmutable
 
+# Misma base de datos que ya comparten narsil_manual.py y narsil_sistema.py
+# — no se introduce ningún almacén nuevo.
+_DB_COMPARTIDA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "narsil.db")
+
 # ---------------------------------------------------------------------------
-# 1. Registro inmutable (seccion 6 de la arquitectura): ya NO se define
-#    aquí — se importa de narsil_registro_inmutable.py, el mismo módulo
-#    que ahora también usa narsil_auth.py para el login/alta de usuarios.
-#    Antes había dos copias idénticas de esta clase; ahora es una sola
-#    implementación compartida de verdad (26/07/2026).
+# 1. Registro inmutable (seccion 6 de la arquitectura): se importa de
+#    narsil_registro_inmutable.py, el mismo módulo que también usa
+#    narsil_auth.py para el login/alta de usuarios. Ya persiste en disco.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -126,7 +133,7 @@ class Aegis:
         self.heartbeat = VigilanteHeartbeat()
         self.manipulacion = VerificadorManipulacion(clave_secreta)
         self.integridad = VerificadorIntegridadTelemetria()
-        self.registro = RegistroInmutable()
+        self.registro = RegistroInmutable(db_path=_DB_COMPARTIDA)
         self._notificar = notificar
         self._paradas: dict[str, bool] = {}
 
